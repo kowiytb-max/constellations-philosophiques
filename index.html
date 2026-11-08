@@ -618,7 +618,100 @@
     function selectAuthor(id){const a=byId[id];if(!a)return;if(a.extra&&!state.extended)return;state.selected=id;faceAuthor(a);state.hover=null;state.edgeHover=null;tip.hidden=true;if(state.group!=='all'&&state.group!==a.group){state.group='all';$('#cp-family').value='all';state.focus=null;state.zoom=1;}renderPanel();updateHeading();drawSoon();$('#cp-live').textContent=`Fiche ouverte : ${a.name}. ${a.branch}.`;}
     function updateHeading(){$('#cp-map-title').textContent=state.group==='all'?'Un cerveau d’idées':groups[state.group].name.replace('¹','');$('#cp-view-label').textContent=state.group==='all'?'Explorer les liens':'Constellation sélectionnée';$('#cp-count').textContent=state.group==='all'?(state.extended?`${authors.length} entrées · dont ${authors.filter(a=>a.extra).length} hors programme`:'84 entrées · programme officiel'):`${visibleAuthors().filter(a=>a.group===state.group).length} entrées dans ce voisinage`;}
     function resize(){const rect=stage.getBoundingClientRect();width=rect.width;height=rect.height;if(!width||!height)return;dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);drawSoon();}
-    function drawSoon(){if(requested)return;requested=true;requestAnimationFrame(()=>{requested=false;draw();});}
+    // Visual effects reuse the existing connections; the static map is cached.
+    const mapMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+    const mapFx={cache:document.createElement('canvas'),dirty:true,last:0,time:0,lanes:[],labels:[],inView:true};
+    mapFx.ctx=mapFx.cache.getContext('2d');
+    function queueMapFrame(){
+      if(requested||document.hidden||state.screen!=='map'||!mapFx.inView)return;
+      requested=true;requestAnimationFrame(animateMapFrame);
+    }
+    function drawSoon(){mapFx.dirty=true;queueMapFrame();}
+    function animateMapFrame(now){
+      requested=false;
+      if(document.hidden||state.screen!=='map'||!mapFx.inView||!width||!height){mapFx.last=0;return;}
+      const refreshed=mapFx.dirty;
+      if(refreshed){draw();mapFx.dirty=false;}
+      if(mapMotion.matches||!mapFx.ctx){mapFx.last=0;return;}
+      // A lightweight repaint, capped at 30 fps, without rebuilding the 3D mesh.
+      if(refreshed||now-mapFx.last>=1000/30){
+        mapFx.time+=mapFx.last?Math.min(.08,(now-mapFx.last)/1000):0;
+        mapFx.last=now;
+        ctx.setTransform(dpr,0,0,dpr,0,0);ctx.globalAlpha=1;
+        ctx.drawImage(mapFx.cache,0,0,width,height);
+        drawMapEffects(mapFx.time);
+      }
+      queueMapFrame();
+    }
+    function cacheMapScene(labels){
+      if(!mapFx.ctx)return;
+      if(mapFx.cache.width!==canvas.width||mapFx.cache.height!==canvas.height){
+        mapFx.cache.width=canvas.width;mapFx.cache.height=canvas.height;
+      }
+      mapFx.ctx.drawImage(canvas,0,0);
+      mapFx.labels=labels;
+      const anchor=state.hover||state.selected;
+      const available=projectedEdges.filter(p=>active(p.e.a)&&active(p.e.b)&&(state.mode==='2d'||p.a.front||p.b.front));
+      const focused=p=>p.e.a.id===anchor||p.e.b.id===anchor||p.e.index===state.edgeHover;
+      const linked=available.filter(focused).sort((a,b)=>Number(b.e.index===state.edgeHover)-Number(a.e.index===state.edgeHover));
+      const ambient=available.filter(p=>!focused(p)).sort((a,b)=>(a.e.index*37%101)-(b.e.index*37%101));
+      mapFx.lanes=[...linked.slice(0,4),...ambient.slice(0,3)];
+    }
+    function sampleConnection(points,t){
+      const scaled=Math.max(0,Math.min(1,t))*(points.length-1),i=Math.min(points.length-2,Math.floor(scaled)),f=scaled-i;
+      const a=points[i],b=points[i+1];
+      return{x:a.x+(b.x-a.x)*f,y:a.y+(b.y-a.y)*f,z:a.z+(b.z-a.z)*f,dx:b.x-a.x,dy:b.y-a.y};
+    }
+    function drawMapEffects(time){
+      ctx.save();ctx.lineCap='round';ctx.lineJoin='round';ctx.setLineDash([]);
+      // Keep names fully legible: animation never paints over their label boxes.
+      ctx.beginPath();ctx.rect(0,0,width,height);
+      for(const b of mapFx.labels)ctx.rect(b.x-3,b.y-2,b.w+6,b.h+4);
+      ctx.clip('evenodd');
+      for(const lane of mapFx.lanes){
+        const {e,samples}=lane,anchor=state.hover||state.selected;
+        const focused=e.a.id===anchor||e.b.id===anchor||e.index===state.edgeHover;
+        const period=focused?4.8:6.3,duration=focused?2.7:2.9;
+        const clock=time+(e.index*.731)%period,phase=clock%period;
+        if(phase>=duration)continue;
+        const progress=phase/duration,head=progress*1.22,tail=Math.max(0,head-.22),end=Math.min(1,head);
+        const reverse=e.type==='parallel'&&Math.floor(clock/period)%2===1;
+        const headPoint=sampleConnection(samples,reverse?1-end:end);
+        if(state.mode==='3d'&&headPoint.z< -55&&!focused)continue;
+        const depth=state.mode==='2d'?1:.25+.75*depthOpacity(headPoint.z);
+        const fade=Math.pow(Math.sin(Math.PI*progress),.7)*depth*(focused?1:.60);
+        const trace=[];
+        for(let i=0;i<=12;i++){
+          const u=i/12,t=tail+(end-tail)*u,p=sampleConnection(samples,reverse?1-t:t),length=Math.hypot(p.dx,p.dy)||1;
+          // A fine, stable zigzag suggests electricity without flashing.
+          const offset=Math.sin(i*2.43+e.index)*Math.sin(Math.PI*u)*(focused?1.65:1.05);
+          trace.push({x:p.x-p.dy/length*offset,y:p.y+p.dx/length*offset});
+        }
+        const path=()=>{ctx.beginPath();trace.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));};
+        const grad=ctx.createLinearGradient(trace[0].x,trace[0].y,headPoint.x,headPoint.y);
+        grad.addColorStop(0,color(e.a,0));grad.addColorStop(.55,color(e.a,fade*.65));grad.addColorStop(1,color(e.b,fade*.94));
+        path();ctx.strokeStyle=grad;ctx.lineWidth=palette.dark?5.2:4;ctx.globalAlpha=palette.dark?.25:.17;ctx.stroke();
+        path();ctx.lineWidth=1.45;ctx.globalAlpha=1;ctx.stroke();
+        path();ctx.strokeStyle=palette.dark?`rgba(236,247,255,${fade*.75})`:color(e.b,fade*.78);ctx.lineWidth=.55;ctx.stroke();
+        ctx.fillStyle=palette.dark?`rgba(243,250,255,${fade*.9})`:color(e.b,fade);
+        ctx.beginPath();ctx.arc(headPoint.x,headPoint.y,focused?1.45:1.05,0,Math.PI*2);ctx.fill();
+      }
+      for(const p of projected){
+        if(!active(p.a)||!p.front||(p.a.id!==state.selected&&p.a.id!==state.hover))continue;
+        const breathing=.5+.5*Math.sin(time*Math.PI*2/4.8),radius=p.r*(4.4+breathing*.8);
+        const glow=ctx.createRadialGradient(p.x,p.y,p.r,p.x,p.y,radius);
+        glow.addColorStop(0,color(p.a,(palette.dark?.14:.09)*breathing));glow.addColorStop(1,color(p.a,0));
+        ctx.fillStyle=glow;ctx.beginPath();ctx.arc(p.x,p.y,radius,0,Math.PI*2);ctx.fill();
+        ctx.strokeStyle=color(p.a,.12+breathing*.25);ctx.lineWidth=1.2;
+        ctx.beginPath();ctx.arc(p.x,p.y,p.r+6,0,Math.PI*2);ctx.stroke();
+      }
+      ctx.restore();
+    }
+    mapMotion.addEventListener('change',drawSoon);
+    document.addEventListener('visibilitychange',()=>{mapFx.last=0;if(!document.hidden)drawSoon();});
+    if('IntersectionObserver' in window)new IntersectionObserver(entries=>{
+      mapFx.inView=entries[0].isIntersecting;mapFx.last=0;if(mapFx.inView)drawSoon();
+    }).observe(canvas);
     function rotateVector(pos){
       if(state.mode==='2d')return [pos[0],pos[1],pos[2]];
       const c=Math.cos(state.yaw),s=Math.sin(state.yaw),cp=Math.cos(state.pitch),sp=Math.sin(state.pitch);
@@ -751,6 +844,7 @@
         if(isSelected||isHovered){ctx.fillStyle=palette.bg;ctx.globalAlpha=.95;ctx.fillRect(box.x-2,box.y-1,box.w+4,box.h+2);ctx.globalAlpha=1;}else{ctx.lineWidth=3;ctx.lineJoin='round';ctx.strokeStyle=palette.bg;ctx.strokeText(text,box.tx,box.ty);}
         ctx.fillStyle=isSelected||near?palette.text:palette.muted;ctx.fillText(text,box.tx,box.ty);total++;
       }
+      cacheMapScene(occupied);
     }
 
     function hideTip(){tip.hidden=true;state.hover=null;state.edgeHover=null;drawSoon();}
